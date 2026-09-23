@@ -20,10 +20,14 @@ function formatTime(iso: string): string {
 }
 
 export interface LedgerProps {
-  /** 当前台账状态（由 App 持有并持久化） */
+  /** 当前台账状态（由 App 持有：提交成功或外部标签页写入后更新） */
   ledger: LedgerState;
-  /** 命令产出新状态后回写 */
-  onLedgerChange: (next: LedgerState) => void;
+  /**
+   * 原子提交一条命令产出的新状态。
+   * 返回提交结果：成功时界面已同步为新台账；失败（其他标签页先写入 /
+   * 存储拒绝写入）时当前动作被整体拒绝，界面同步回存储中的最后完整台账。
+   */
+  commitLedgerState: (next: LedgerState) => { ok: true } | { ok: false; message: string };
   /** 当前选中的批次 id（由 App 持有，配液建档后可跳转选中） */
   selectedId: string | null;
   onSelectBatch: (id: string | null) => void;
@@ -31,11 +35,15 @@ export interface LedgerProps {
 
 /**
  * 容量台账视图：创建药液批次 → 选中批次登记用量 → 按时间查看使用记录。
- * 台账状态由 App 持有：每次命令产出的新状态经 onLedgerChange 回写并整体持久化，
- * 因此刷新后还原同一台账。所有写入都经过领域命令，失败原因就地展示。
+ *
+ * 跨标签页安全：所有写入都不在本地先「乐观」更新，而是交给 commitLedgerState
+ * 做「重新读取 → 版本比对 → 原子写入」。其他标签页已先写入或浏览器存储拒绝写入时，
+ * 当前动作被拒绝：本视图不显示任何未记账的成功状态与扣减，改显示横幅说明原因，
+ * 并自动呈现存储中的最后完整台账（批次、记录顺序、剩余量与所有页面一致）。
+ *
  * 从配液计算「存入容量台账」建立的批次带有配液来源快照，选中后展示来源摘要。
  */
-export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBatch }: LedgerProps) {
+export default function Ledger({ ledger, commitLedgerState, selectedId, onSelectBatch }: LedgerProps) {
   const deps = useMemo(() => defaultLedgerDeps(), []);
 
   // 新建批次表单
@@ -48,6 +56,10 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
   const [films, setFilms] = useState('');
   const [note, setNote] = useState('');
   const [filmsError, setFilmsError] = useState<string | null>(null);
+
+  // 提交被拒（其他标签页先写入 / 存储失败）时的横幅；
+  // 与字段级错误分开：字段非法由字段下方提示，且根本不会进入提交流程。
+  const [writeError, setWriteError] = useState<string | null>(null);
 
   const selected = ledger.batches.find((batch) => batch.id === selectedId) ?? null;
   const selectedRecords = selected ? batchRecords(ledger, selected.id) : [];
@@ -64,6 +76,7 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
 
   const submitCreate = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    setWriteError(null);
     // 先把字段级错误放到对应输入框下方；命令仍会再校验一次（最终闸门）。
     const nameErr = validateBatchName(name);
     const capacityErr = validateCapacityInput(capacity);
@@ -76,7 +89,13 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
       setCapacityError(result.error);
       return;
     }
-    onLedgerChange(result.state);
+    // 原子提交：版本不符（其他标签页先写入）或存储失败时整体拒绝，
+    // 不清空表单、不显示新批次，由横幅说明；台账内容以存储为准（已同步）。
+    const committed = commitLedgerState(result.state);
+    if (!committed.ok) {
+      setWriteError(committed.message);
+      return;
+    }
     onSelectBatch(result.value.id);
     setName('');
     setCapacity('');
@@ -85,6 +104,7 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
   const submitUsage = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selected) return;
+    setWriteError(null);
     const filmsErr = validateFilmsInput(films);
     setFilmsError(filmsErr ?? null);
     if (filmsErr) return;
@@ -95,13 +115,25 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
       setFilmsError(result.error);
       return;
     }
-    onLedgerChange(result.state);
+    // 原子提交：绝不先在本地扣减余量。其他标签页先写入（可能已耗尽本批）
+    // 或存储拒绝写入时，本动作被拒绝，记录不出现、余量不变，横幅说明原因；
+    // 操作员可按已刷新的最新剩余容量核对后用保留的草稿重新提交。
+    const committed = commitLedgerState(result.state);
+    if (!committed.ok) {
+      setWriteError(committed.message);
+      return;
+    }
     setFilms('');
     setNote('');
   };
 
   return (
     <>
+      {writeError && (
+        <p className="write-error" role="alert" data-testid="ledger-write-error">
+          {writeError}
+        </p>
+      )}
       <section className="panel no-print" aria-label="新建药液批次">
         <h2 className="panel-title">新建药液批次</h2>
         <form onSubmit={submitCreate} noValidate>

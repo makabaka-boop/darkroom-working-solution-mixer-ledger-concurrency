@@ -84,9 +84,17 @@ export interface UsageRecord {
 export interface LedgerState {
   batches: ChemicalBatch[];
   records: UsageRecord[];
+  /**
+   * 台账文档版本（单调递增）。
+   * 每成功落盘一次（提交一次命令）版本 +1，用于跨标签页的乐观并发控制：
+   * 提交时若发现存储中的版本已不是本页所依据的版本，说明其他标签页
+   * 先写入了新台账，本次提交必须整体拒绝，而不是用旧状态覆盖新台账。
+   * 旧版本存储没有该字段，读取时按 0 处理；空台账版本也是 0。
+   */
+  version: number;
 }
 
-export const EMPTY_LEDGER: LedgerState = { batches: [], records: [] };
+export const EMPTY_LEDGER: LedgerState = { batches: [], records: [], version: 0 };
 
 /** 命令依赖：时间与 id 生成器可注入，便于测试复现。 */
 export interface LedgerDeps {

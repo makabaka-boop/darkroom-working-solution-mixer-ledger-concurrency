@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   computeMix,
   validateInputs,
@@ -19,7 +19,14 @@ import {
   type LedgerState,
   type MixSourceSnapshot,
 } from './lib/capacityLedger';
-import { browserStorage, loadLedger, saveLedger } from './lib/ledgerStorage';
+import {
+  browserStorage,
+  commitFailureMessage,
+  commitLedger,
+  LEDGER_STORAGE_KEY,
+  loadLedger,
+  parseLedger,
+} from './lib/ledgerStorage';
 import { loadSafelightState, saveSafelightState } from './lib/safelightStorage';
 import type { SafelightState } from './lib/safelightTest';
 import Ledger from './Ledger';
@@ -70,13 +77,54 @@ export default function App() {
   const [raw, setRaw] = useState<RawInputs>({ n: '4', total: '1000', capacity: '250', tanks: '1' });
   const [checked, setChecked] = useState<boolean[]>([]);
 
-  // 容量台账状态由本组件持有并整体持久化：配液结果区可直接建档后切换过去展示。
+  // 容量台账状态由本组件持有。任何写入都走 commitLedgerState 的
+  // 「重新读取 → 版本比对 → 原子写入」协议，绝不在本地乐观扣减后无条件覆盖存储；
+  // 另通过 storage 事件实时同步其他标签页的写入，所有页面最终显示同一台账。
+  const storage = useMemo(() => browserStorage(), []);
   const [ledger, setLedger] = useState<LedgerState>(() => loadLedger(browserStorage()));
+  // 始终保存本页已知的最新台账：提交时作为版本依据，避免闭包读到旧 state。
+  const ledgerRef = useRef(ledger);
+  ledgerRef.current = ledger;
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const ledgerDeps = useMemo(() => defaultLedgerDeps(), []);
+
+  // 其他标签页成功写入（或清空）台账后，浏览器在本页派发 storage 事件：
+  // 直接以存储内容为准刷新本页，操作员不会继续按过期的批次状态 / 剩余量提交。
+  // 本标签页自己的写入不触发 storage 事件（提交成功时已同步更新），无需去重。
   useEffect(() => {
-    saveLedger(browserStorage(), ledger);
-  }, [ledger]);
+    if (!storage || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== LEDGER_STORAGE_KEY) return;
+      const next = event.newValue === null ? loadLedger(storage) : parseLedger(event.newValue);
+      if (next) {
+        ledgerRef.current = next;
+        setLedger(next);
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [storage]);
+
+  /**
+   * 原子提交命令产出的新状态。
+   * 成功：状态与存储一致（版本 +1）；失败：其他标签页先写入（conflict）或
+   * 存储拒绝写入（unavailable / rejected），当前动作被拒绝，本页同步到存储中的
+   * 最后完整台账并把原因返回给调用方就地提示。任何情况下都不产生「看似成功、
+   * 刷新后回滚」的本地假象。
+   */
+  const commitLedgerState = (next: LedgerState): { ok: true } | { ok: false; message: string } => {
+    const result = commitLedger(storage, ledgerRef.current.version, next);
+    if (result.ok) {
+      ledgerRef.current = result.state;
+      setLedger(result.state);
+      return { ok: true };
+    }
+    ledgerRef.current = result.stored;
+    setLedger(result.stored);
+    return { ok: false, message: commitFailureMessage(result.reason) };
+  };
 
   // 安全灯测试状态由本组件持有并持久化到独立的 localStorage 键，与台账互不影响。
   // 存档损坏时 loadSafelightState 报告 corrupted，界面就地提示。
@@ -103,6 +151,9 @@ export default function App() {
   const [storeCapacity, setStoreCapacity] = useState('');
   const [storeNameError, setStoreNameError] = useState<string | null>(null);
   const [storeCapacityError, setStoreCapacityError] = useState<string | null>(null);
+  // 台账侧提交被拒（其他标签页先写入 / 存储失败）：在配液页就地横幅说明，
+  // 不切换页面，批次并未创建，草稿保留以便核对后重试。
+  const [storeWriteError, setStoreWriteError] = useState<string | null>(null);
 
   // 每次输入变化都重新校验、重新计算；任一字段非法则 result 为 null，
   // 旧配液卡随之卸载，不会残留。
@@ -142,6 +193,7 @@ export default function App() {
     setStoreCapacity('');
     setStoreNameError(null);
     setStoreCapacityError(null);
+    setStoreWriteError(null);
   }, [rawSignature]);
 
   const doneCount = checked.filter(Boolean).length;
@@ -161,6 +213,7 @@ export default function App() {
   const submitStoreToLedger = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!result) return;
+    setStoreWriteError(null);
     const nameErr = validateBatchName(storeName);
     const capacityErr = validateCapacityInput(storeCapacity);
     setStoreNameError(nameErr ?? null);
@@ -177,7 +230,7 @@ export default function App() {
       water: result.water,
     };
     const created = createBatch(
-      ledger,
+      ledgerRef.current,
       { name: storeName, capacity: storeCapacity, mixSource },
       ledgerDeps,
     );
@@ -186,7 +239,13 @@ export default function App() {
       setStoreCapacityError(created.error);
       return;
     }
-    setLedger(created.state);
+    // 原子提交：其他标签页先写入（新建了批次 / 登记了记录）或存储失败时，
+    // 本批次不创建、不切换页面，横幅说明并保留草稿；台账已同步为存储内容。
+    const committed = commitLedgerState(created.state);
+    if (!committed.ok) {
+      setStoreWriteError(committed.message);
+      return;
+    }
     setSelectedBatchId(created.value.id);
     setStoreName('');
     setStoreCapacity('');
@@ -254,7 +313,7 @@ export default function App() {
         <main>
           <Ledger
             ledger={ledger}
-            onLedgerChange={setLedger}
+            commitLedgerState={commitLedgerState}
             selectedId={selectedBatchId}
             onSelectBatch={setSelectedBatchId}
           />
@@ -384,6 +443,11 @@ export default function App() {
 
               <div className="store-ledger" data-testid="store-to-ledger">
                 <h3>存入容量台账</h3>
+                {storeWriteError && (
+                  <p className="write-error" role="alert" data-testid="store-write-error">
+                    {storeWriteError}
+                  </p>
+                )}
                 <p className="note">
                   把本次配液参数（1+{result.n}、总量 {result.total} mL、显影罐 {result.tanks}{' '}
                   只）随批次固定保存，台账中可追溯来源。

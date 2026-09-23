@@ -318,6 +318,17 @@ header h1 {
   margin: 6px 0 0;
 }
 
+/* 台账提交被拒（其他标签页先写入 / 存储失败）的整区横幅 */
+.write-error {
+  color: var(--accent);
+  font-weight: 600;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 0 0 16px;
+}
+
 .result h2 {
   margin-top: 0;
   display: flex;

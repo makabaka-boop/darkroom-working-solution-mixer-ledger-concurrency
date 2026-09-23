@@ -141,6 +141,7 @@ describe('容量台账持久化', () => {
         },
       ],
       records: good.records,
+      version: good.version,
     };
     expect(parseLedger(JSON.stringify(dirty))).toBeNull();
     saveLedger(storage, dirty);
