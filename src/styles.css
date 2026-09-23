@@ -318,6 +318,15 @@ header h1 {
   margin: 6px 0 0;
 }
 
+/* 跨标签冲突 / 存储失败 / 损坏时的动作级提示：独立面板感，区别于字段下方原因 */
+.ledger-banner {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0 0 20px;
+}
+
 .result h2 {
   margin-top: 0;
   display: flex;

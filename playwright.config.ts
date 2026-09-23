@@ -12,7 +12,13 @@ export default defineConfig({
   timeout: 30_000,
   retries: 0,
   reporter: process.env.CI ? 'line' : 'list',
-  use: { baseURL },
+  use: {
+    baseURL,
+    // 受限容器（无 root / 无用户命名空间）下通过 PW_DISABLE_SANDBOX=1 运行
+    launchOptions: process.env.PW_DISABLE_SANDBOX
+      ? { args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+      : undefined,
+  },
   webServer: process.env.E2E_BASE_URL
     ? undefined
     : {

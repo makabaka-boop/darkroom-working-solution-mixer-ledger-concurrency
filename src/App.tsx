@@ -12,14 +12,20 @@ import {
   type RawInputs,
 } from './lib/dilution';
 import {
-  createBatch,
   defaultLedgerDeps,
   validateBatchName,
   validateCapacityInput,
-  type LedgerState,
   type MixSourceSnapshot,
 } from './lib/capacityLedger';
-import { browserStorage, loadLedger, saveLedger } from './lib/ledgerStorage';
+import {
+  browserStorage,
+  commitLedger,
+  loadLedgerDocument,
+  LEDGER_STORAGE_KEY,
+  type CommitOutcome,
+  type LedgerDocument,
+  type LedgerIntent,
+} from './lib/ledgerStorage';
 import { loadSafelightState, saveSafelightState } from './lib/safelightStorage';
 import type { SafelightState } from './lib/safelightTest';
 import Ledger from './Ledger';
@@ -70,13 +76,55 @@ export default function App() {
   const [raw, setRaw] = useState<RawInputs>({ n: '4', total: '1000', capacity: '250', tanks: '1' });
   const [checked, setChecked] = useState<boolean[]>([]);
 
-  // 容量台账状态由本组件持有并整体持久化：配液结果区可直接建档后切换过去展示。
-  const [ledger, setLedger] = useState<LedgerState>(() => loadLedger(browserStorage()));
-  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  // 容量台账文档（台账 + 修订号）由本组件持有：
+  // - 初始化时从 localStorage 读取（损坏则置空并提示，且不再写回覆盖原文）；
+  // - 所有写入都走 commitLedger 乐观并发提交，保证跨标签不覆盖、容量不为负；
+  // - 监听 storage 事件：其他标签写入后本页自动对齐同一批次集合、记录顺序与剩余量。
+  const storage = useMemo(() => browserStorage(), []);
   const ledgerDeps = useMemo(() => defaultLedgerDeps(), []);
+  const [ledgerLoad] = useState(() => loadLedgerDocument(storage));
+  const [doc, setDoc] = useState<LedgerDocument>(ledgerLoad.doc);
+  const [ledgerCorrupted, setLedgerCorrupted] = useState(!ledgerLoad.ok);
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+
+  // 其他标签页提交后，storage 事件把最新文档推送到本页：
+  // 比较修订号，避免重复渲染；损坏的外部写入不同步（交由提交路径处理）。
   useEffect(() => {
-    saveLedger(browserStorage(), ledger);
-  }, [ledger]);
+    if (typeof window === 'undefined' || !window.addEventListener) return;
+    const syncFromStorage = (event: StorageEvent) => {
+      if (event.key !== LEDGER_STORAGE_KEY) return;
+      const load = loadLedgerDocument(storage);
+      if (!load.ok) {
+        setLedgerCorrupted(true);
+        return;
+      }
+      setDoc((current) => (load.doc.revision === current.revision ? current : load.doc));
+    };
+    window.addEventListener('storage', syncFromStorage);
+    return () => window.removeEventListener('storage', syncFromStorage);
+  }, [storage]);
+
+  /**
+   * 跨标签安全的台账提交：以当前文档修订号为基准，
+   * 在存储最新台账上重放命令并原子写回。
+   * 任何失败（冲突 / 存储拒绝 / 损坏）都只拒绝当前动作，
+   * 并把视图对齐到存储中的最后完整台账，绝不保留「假装成功」的本地状态。
+   */
+  const commit = (intent: LedgerIntent): CommitOutcome => {
+    const outcome = commitLedger(storage, doc, intent, ledgerDeps);
+    if (outcome.ok) {
+      // 只有真正写回成功（损坏原文被一次有意的新提交覆盖）才解除损坏标记
+      setDoc(outcome.doc);
+      setLedgerCorrupted(false);
+    } else if (outcome.kind === 'conflict' || outcome.kind === 'storage') {
+      // 视图对齐最新（冲突）或保持最后完整（存储失败）台账；损坏标记维持原样
+      setDoc(outcome.doc);
+    } else if (outcome.kind === 'corrupted') {
+      setDoc(outcome.doc);
+      setLedgerCorrupted(true);
+    }
+    return outcome;
+  };
 
   // 安全灯测试状态由本组件持有并持久化到独立的 localStorage 键，与台账互不影响。
   // 存档损坏时 loadSafelightState 报告 corrupted，界面就地提示。
@@ -103,6 +151,8 @@ export default function App() {
   const [storeCapacity, setStoreCapacity] = useState('');
   const [storeNameError, setStoreNameError] = useState<string | null>(null);
   const [storeCapacityError, setStoreCapacityError] = useState<string | null>(null);
+  // 跨标签冲突 / 存储写入失败等动作级错误（非字段校验问题）
+  const [storeCommitError, setStoreCommitError] = useState<string | null>(null);
 
   // 每次输入变化都重新校验、重新计算；任一字段非法则 result 为 null，
   // 旧配液卡随之卸载，不会残留。
@@ -142,6 +192,7 @@ export default function App() {
     setStoreCapacity('');
     setStoreNameError(null);
     setStoreCapacityError(null);
+    setStoreCommitError(null);
   }, [rawSignature]);
 
   const doneCount = checked.filter(Boolean).length;
@@ -158,6 +209,7 @@ export default function App() {
 
   // 把本次配液结果连同批次一并写入容量台账，随后切换过去展示来源摘要。
   // 名称或容量校验失败时就地说明原因：不切换页面、不写入台账。
+  // 跨标签冲突 / 存储写入失败同样不切换页面、不写入，就地说明并保留最后完整台账。
   const submitStoreToLedger = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!result) return;
@@ -165,6 +217,7 @@ export default function App() {
     const capacityErr = validateCapacityInput(storeCapacity);
     setStoreNameError(nameErr ?? null);
     setStoreCapacityError(capacityErr ?? null);
+    setStoreCommitError(null);
     if (nameErr || capacityErr) return;
 
     // 快照逐字段取自当前这一次计算结果（同一 result），不做任何重算
@@ -176,21 +229,28 @@ export default function App() {
       concentrate: result.concentrate,
       water: result.water,
     };
-    const created = createBatch(
-      ledger,
-      { name: storeName, capacity: storeCapacity, mixSource },
-      ledgerDeps,
-    );
-    if (!created.ok) {
-      // 命令级失败同样就地说明，不切换页面、不写入台账
-      setStoreCapacityError(created.error);
+    const outcome = commit({
+      type: 'createBatch',
+      input: { name: storeName, capacity: storeCapacity, mixSource },
+    });
+    if (outcome.ok) {
+      const created = outcome.intent.result.ok ? outcome.intent.result.value : null;
+      setSelectedBatchId(created ? created.id : null);
+      setStoreName('');
+      setStoreCapacity('');
+      setStoreCommitError(null);
+      setView('ledger');
       return;
     }
-    setLedger(created.state);
-    setSelectedBatchId(created.value.id);
-    setStoreName('');
-    setStoreCapacity('');
-    setView('ledger');
+    if (outcome.kind === 'rejected') {
+      // 命令级失败（如快照不完整）就地说明，不切换页面、不写入台账
+      const commandError = outcome.intent.result.ok ? null : outcome.intent.result.error;
+      if (commandError === '请输入药液名称') setStoreNameError(commandError);
+      else if (commandError) setStoreCapacityError(commandError);
+      return;
+    }
+    // 冲突 / 存储失败 / 损坏：未建档、未切换页面，表单保留便于核对重试
+    setStoreCommitError(outcome.error);
   };
 
   // tankNumber 仅在分罐时传入：步骤名称必须显式包含罐号，
@@ -253,10 +313,11 @@ export default function App() {
       {view === 'ledger' ? (
         <main>
           <Ledger
-            ledger={ledger}
-            onLedgerChange={setLedger}
+            doc={doc}
+            onCommit={commit}
             selectedId={selectedBatchId}
             onSelectBatch={setSelectedBatchId}
+            storageCorrupted={ledgerCorrupted}
           />
         </main>
       ) : view === 'safelight' ? (
@@ -399,6 +460,7 @@ export default function App() {
                         onChange={(event) => {
                           setStoreName(event.target.value);
                           setStoreNameError(null);
+                          setStoreCommitError(null);
                         }}
                         aria-invalid={Boolean(storeNameError)}
                         aria-describedby="error-store-name store-name-hint"
@@ -427,6 +489,7 @@ export default function App() {
                         onChange={(event) => {
                           setStoreCapacity(event.target.value);
                           setStoreCapacityError(null);
+                          setStoreCommitError(null);
                         }}
                         aria-invalid={Boolean(storeCapacityError)}
                         aria-describedby="error-store-capacity store-capacity-hint"
@@ -453,6 +516,11 @@ export default function App() {
                   >
                     存入容量台账
                   </button>
+                  {storeCommitError && (
+                    <p className="error ledger-banner" role="alert" data-testid="store-ledger-error">
+                      {storeCommitError}
+                    </p>
+                  )}
                 </form>
               </div>
             </section>

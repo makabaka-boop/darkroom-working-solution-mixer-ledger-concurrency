@@ -1,18 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   BATCH_STATUS_LABEL,
   batchRecords,
   batchStatus,
-  createBatch,
-  defaultLedgerDeps,
-  recordUsage,
   remainingCapacity,
   usedCapacity,
   validateBatchName,
   validateCapacityInput,
   validateFilmsInput,
-  type LedgerState,
 } from './lib/capacityLedger';
+import type { CommitOutcome, LedgerDocument, LedgerIntent } from './lib/ledgerStorage';
 
 function formatTime(iso: string): string {
   const date = new Date(iso);
@@ -20,23 +17,32 @@ function formatTime(iso: string): string {
 }
 
 export interface LedgerProps {
-  /** 当前台账状态（由 App 持有并持久化） */
-  ledger: LedgerState;
-  /** 命令产出新状态后回写 */
-  onLedgerChange: (next: LedgerState) => void;
+  /** 当前台账文档（台账 + 修订号，由 App 持有并随存储同步） */
+  doc: LedgerDocument;
+  /**
+   * 跨标签安全的提交：在存储最新台账上重放命令并比较修订号。
+   * 成功才落账；冲突 / 存储失败 / 损坏时整体拒绝并返回最新完整文档。
+   */
+  onCommit: (intent: LedgerIntent) => CommitOutcome;
   /** 当前选中的批次 id（由 App 持有，配液建档后可跳转选中） */
   selectedId: string | null;
   onSelectBatch: (id: string | null) => void;
+  /** 启动时读取到损坏 / 被策略阻止的存储：就地提示，不做任何写回 */
+  storageCorrupted: boolean;
 }
 
 /**
  * 容量台账视图：创建药液批次 → 选中批次登记用量 → 按时间查看使用记录。
- * 台账状态由 App 持有：每次命令产出的新状态经 onLedgerChange 回写并整体持久化，
- * 因此刷新后还原同一台账。所有写入都经过领域命令，失败原因就地展示。
- * 从配液计算「存入容量台账」建立的批次带有配液来源快照，选中后展示来源摘要。
+ *
+ * 所有写入都经过 onCommit（乐观并发提交）：
+ * - 领域规则拒绝（非法输入、超剩余容量）→ 对应字段下方就地说明，不写存储；
+ * - 其他页面已提交（修订号冲突）或 localStorage 写入失败 →
+ *   顶部就地说明，本次动作不记账，界面回显存储中的最后完整台账；
+ * - 其他标签页写入后，App 通过 storage 事件把最新台账推送到本视图，
+ *   批次状态与剩余量自动刷新，无需手动重载。
  */
-export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBatch }: LedgerProps) {
-  const deps = useMemo(() => defaultLedgerDeps(), []);
+export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, storageCorrupted }: LedgerProps) {
+  const ledger = doc.ledger;
 
   // 新建批次表单
   const [name, setName] = useState('');
@@ -49,8 +55,22 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
   const [note, setNote] = useState('');
   const [filmsError, setFilmsError] = useState<string | null>(null);
 
+  // 冲突 / 存储失败等动作级错误（不属于单个输入字段）
+  const [commitError, setCommitError] = useState<string | null>(null);
+  // 最近一次「失败后对齐到的修订号」：此时 revision 变化是本次失败的结果，
+  // 不能误清掉刚展示的错误提示（见下方 effect）。
+  const failedAtRevision = useRef<number | null>(null);
+
   const selected = ledger.batches.find((batch) => batch.id === selectedId) ?? null;
   const selectedRecords = selected ? batchRecords(ledger, selected.id) : [];
+
+  // 外部标签页写入（storage 事件）导致文档变化时，清掉已失效的动作级提示；
+  // 但要跳过「本组件一次失败提交把视图对齐到最新文档」引发的同一次变化，
+  // 否则冲突 / 存储失败提示刚展示就会被清掉。
+  useEffect(() => {
+    if (failedAtRevision.current === doc.revision) return;
+    setCommitError(null);
+  }, [doc.revision]);
 
   // 切换（或取消）选中批次时，丢弃上一批尚未提交的用量 / 备注草稿与错误，
   // 避免操作员在 A 批次填写后直接记到 B 批次（跨批次误登记）。
@@ -64,22 +84,36 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
 
   const submitCreate = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    // 先把字段级错误放到对应输入框下方；命令仍会再校验一次（最终闸门）。
+    // 先把字段级错误放到对应输入框下方；提交时命令仍会再校验一次（最终闸门）。
     const nameErr = validateBatchName(name);
     const capacityErr = validateCapacityInput(capacity);
     setNameError(nameErr ?? null);
     setCapacityError(capacityErr ?? null);
+    setCommitError(null);
     if (nameErr || capacityErr) return;
 
-    const result = createBatch(ledger, { name, capacity }, deps);
-    if (!result.ok) {
-      setCapacityError(result.error);
+    const outcome = onCommit({ type: 'createBatch', input: { name, capacity } });
+    if (outcome.ok) {
+      const created = outcome.intent.result.ok ? outcome.intent.result.value : null;
+      onSelectBatch(created ? created.id : null);
+      setName('');
+      setCapacity('');
+      setCommitError(null);
       return;
     }
-    onLedgerChange(result.state);
-    onSelectBatch(result.value.id);
-    setName('');
-    setCapacity('');
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      if (!result.ok) {
+        if (result.error === '请输入药液名称') setNameError(result.error);
+        else setCapacityError(result.error);
+      }
+      return;
+    }
+    // 冲突 / 存储失败 / 损坏：批次未创建，表单保留便于核对后重试。
+    // 记录「失败后对齐到的修订号」：App 会把文档换成 outcome.doc，
+    // 这里提前记下其修订号，避免对齐触发的 effect 清掉本次提示。
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
   };
 
   const submitUsage = (event: React.FormEvent<HTMLFormElement>) => {
@@ -87,21 +121,39 @@ export default function Ledger({ ledger, onLedgerChange, selectedId, onSelectBat
     if (!selected) return;
     const filmsErr = validateFilmsInput(films);
     setFilmsError(filmsErr ?? null);
+    setCommitError(null);
     if (filmsErr) return;
 
-    const result = recordUsage(ledger, { batchId: selected.id, films, note }, deps);
-    if (!result.ok) {
-      // 超过剩余容量等命令级错误同样就地说明，且不写入任何记录
-      setFilmsError(result.error);
+    const outcome = onCommit({ type: 'recordUsage', input: { batchId: selected.id, films, note } });
+    if (outcome.ok) {
+      setFilms('');
+      setNote('');
+      setCommitError(null);
       return;
     }
-    onLedgerChange(result.state);
-    setFilms('');
-    setNote('');
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      // 超过剩余容量等命令级错误同样就地说明，且不写入任何记录
+      if (!result.ok) setFilmsError(result.error);
+      return;
+    }
+    // 冲突 / 存储失败 / 损坏：本次用量未记账。
+    // 冲突时界面已随最新文档刷新（剩余量、记录列表都是最新）；
+    // 存储失败时文档保持最后完整台账，输入保留，操作员可重试或放弃。
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
   };
 
   return (
     <>
+      {(storageCorrupted || commitError) && (
+        <p className="error ledger-banner" role="alert" data-testid="ledger-error">
+          {storageCorrupted
+            ? '本地台账无法读取或已损坏，为避免覆盖可追溯数据，当前不会写入任何登记；请刷新页面核对存储内容。'
+            : commitError}
+        </p>
+      )}
+
       <section className="panel no-print" aria-label="新建药液批次">
         <h2 className="panel-title">新建药液批次</h2>
         <form onSubmit={submitCreate} noValidate>
